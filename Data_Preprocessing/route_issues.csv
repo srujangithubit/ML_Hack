@@ -1,0 +1,16 @@
+partition,trip_id,issue_type,route_position,source_line,previous_arc_id,current_arc_id,previous_endpoints,current_endpoints,classification
+train,00000002,route_transition_review,55,,1848,10863,846->5059,5289->5290,no_shared_endpoint
+train,00000019,route_transition_review,96,,85589,51027,40766->849,23488->25511,no_shared_endpoint
+train,00000019,route_transition_review,153,,55059,55050,25416->25413,25408->889,no_shared_endpoint
+train,00000019,route_transition_review,302,,953,23709,434->10107,10862->435,no_shared_endpoint
+train,00000033,route_transition_review,166,,1003,1002,563->1283,563->553,shared_endpoint_other_orientation
+train,00000041,route_transition_review,14,,1264,519,779->349,348->290,no_shared_endpoint
+train,00000042,route_transition_review,1214,,14661,17989,7108->1762,8726->8734,no_shared_endpoint
+train,00000069,route_transition_review,155,,10165,10172,5080->5083,5084->5082,no_shared_endpoint
+train,00000075,route_transition_review,33,,507,509,225->250,227->231,no_shared_endpoint
+train,00000075,route_transition_review,64,,134,552,58->229,247->220,no_shared_endpoint
+train,00000080,route_transition_review,120,,8899,9194,4223->4222,4363->4364,no_shared_endpoint
+train,00000086,route_transition_review,3,,230068,96025,110977->4019,45354->61763,no_shared_endpoint
+train,00000089,route_transition_review,194,,22715,22703,10787->10765,10779->10796,no_shared_endpoint
+student_test,00000076,route_transition_review,14,,39548,1122,18537->137,509->9982,no_shared_endpoint
+
