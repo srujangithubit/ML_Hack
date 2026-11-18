@@ -1,285 +1,293 @@
-"""PathSnap Member 1B: candidate generation and feature engineering.
+#!/usr/bin/env python3
+"""PathSnap Member 1B: spatial candidate-road generation and feature engineering.
 
-Input layout:
-  cleaned_dataset/{train,student_test}/{trip_id}/{trip_id}.{track,nodes,arcs,route}
+Input: cleaned_dataset/{train,student_test}/{trip_id}/{trip_id}.{track,nodes,arcs,route}
+Output: one row per GPS observation / candidate directed arc.
 
-The script creates one row per (GPS observation, candidate directed arc).
-It never uses route labels for candidate selection or for inference features.
-For train only, labels are attached by a conservative route-order alignment:
-the route arc must appear among the candidates and its segment must lie within
-LABEL_MAX_DISTANCE_M. Ambiguous/unmatched observations get label=-1 and are
-excluded from supervised training by default.
-
-Dependencies: numpy, pandas, scipy
+The .route file is read and used only for training labels, after geographic
+candidate generation. It is never used for candidate selection or inference.
+Labels are approximate route-order labels; unmatched observations stay -1.
 """
-
 from __future__ import annotations
 
 import argparse
 import math
+from bisect import bisect_left
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
-from scipy.spatial import cKDTree
+from shapely import LineString, STRtree, points
 
-EARTH_R = 6_371_008.8
-DEFAULT_RADIUS_M = 60.0
-DEFAULT_MAX_CANDIDATES = 8
-LABEL_MAX_DISTANCE_M = 60.0
+EARTH_R_M = 6_371_008.8
 
 
-def read_numeric(path: Path, cols: int) -> np.ndarray:
-    if not path.exists():
-        raise FileNotFoundError(path)
-    arr = np.loadtxt(path, dtype=float, ndmin=2)
-    if arr.size == 0:
-        return np.empty((0, cols), dtype=float)
-    if arr.shape[1] != cols:
-        raise ValueError(f"{path}: expected {cols} columns, got {arr.shape[1]}")
-    if not np.isfinite(arr).all():
-        raise ValueError(f"{path}: non-finite values found; run Member 1A cleaning first")
-    return arr
+def read_numeric(path: Path, ncols: int) -> np.ndarray:
+    if not path.is_file():
+        raise FileNotFoundError(f"Required file not found: {path}")
+    if path.stat().st_size == 0:
+        if path.suffix == ".route":
+            return np.empty((0, ncols), dtype=float)
+        raise ValueError(f"Required data file is empty: {path}")
+    data = np.loadtxt(path, dtype=float, ndmin=2)
+    if data.shape[1] != ncols:
+        raise ValueError(f"{path}: expected {ncols} columns, found {data.shape[1]}")
+    if not np.isfinite(data).all():
+        raise ValueError(f"{path}: non-finite values; check Member 1A cleaning")
+    return data
 
 
-def haversine_m(lon1, lat1, lon2, lat2):
-    lon1, lat1, lon2, lat2 = map(np.radians, (lon1, lat1, lon2, lat2))
-    dlon = lon2 - lon1
-    dlat = lat2 - lat1
-    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
-    return 2.0 * EARTH_R * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+def project_local(lonlat: np.ndarray, lon0: float, lat0: float) -> np.ndarray:
+    """Local equirectangular projection, returning metres."""
+    lon = np.radians(lonlat[:, 0] - lon0)
+    lat = np.radians(lonlat[:, 1] - lat0)
+    return np.column_stack((
+        EARTH_R_M * math.cos(math.radians(lat0)) * lon,
+        EARTH_R_M * lat,
+    ))
 
 
-def bearing_deg(lon1, lat1, lon2, lat2):
-    lon1, lat1, lon2, lat2 = map(np.radians, (lon1, lat1, lon2, lat2))
-    dlon = lon2 - lon1
-    y = np.sin(dlon) * np.cos(lat2)
-    x = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(dlon)
-    return (np.degrees(np.arctan2(y, x)) + 360.0) % 360.0
+def bearing_xy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Clockwise bearing from north, in degrees [0, 360)."""
+    dx, dy = b[..., 0] - a[..., 0], b[..., 1] - a[..., 1]
+    return (np.degrees(np.arctan2(dx, dy)) + 360.0) % 360.0
 
 
-def angle_diff_deg(a, b):
-    return np.abs((a - b + 180.0) % 360.0 - 180.0)
+def angle_difference(a: float, b: float) -> float:
+    return abs((a - b + 180.0) % 360.0 - 180.0)
 
 
-def local_xy(lon, lat, lon0, lat0):
-    """Local equirectangular projection in metres, accurate for a trip area."""
-    x = np.radians(lon - lon0) * EARTH_R * math.cos(math.radians(lat0))
-    y = np.radians(lat - lat0) * EARTH_R
-    return np.column_stack((x, y))
+def point_segment_features(p: np.ndarray, a: np.ndarray, b: np.ndarray):
+    """Exact projected distance and projection fraction on finite segment AB."""
+    ab = b - a
+    denom = np.einsum("ij,ij->i", ab, ab)
+    ap = p - a
+    numer = np.einsum("ij,ij->i", ap, ab)
+    fraction = np.divide(numer, denom, out=np.zeros_like(numer), where=denom > 1e-12)
+    fraction = np.clip(fraction, 0.0, 1.0)
+    projected = a + fraction[:, None] * ab
+    return np.linalg.norm(p - projected, axis=1), fraction
 
 
-def point_segment_projection(px, py, ax, ay, bx, by):
-    """Vector projection of point P onto finite segment AB; returns distance and t."""
-    vx, vy = bx - ax, by - ay
-    denom = vx * vx + vy * vy
-    if denom <= 1e-12:
-        t = np.zeros_like(px)
-    else:
-        t = np.clip(((px - ax) * vx + (py - ay) * vy) / denom, 0.0, 1.0)
-    qx, qy = ax + t * vx, ay + t * vy
-    return np.hypot(px - qx, py - qy), t
-
-
-def load_trip(trip_dir: Path):
+def load_trip(trip_dir: Path, include_route: bool):
     tid = trip_dir.name
     track = read_numeric(trip_dir / f"{tid}.track", 3)
     nodes = read_numeric(trip_dir / f"{tid}.nodes", 2)
-    arcs = read_numeric(trip_dir / f"{tid}.arcs", 2).astype(np.int64)
-    route_path = trip_dir / f"{tid}.route"
-    route = read_numeric(route_path, 1).reshape(-1).astype(np.int64) if route_path.exists() else np.empty(0, dtype=np.int64)
-
+    arcs_float = read_numeric(trip_dir / f"{tid}.arcs", 2)
+    if not np.equal(arcs_float, np.floor(arcs_float)).all():
+        raise ValueError(f"{tid}: arc endpoints must be integer node IDs")
+    arcs = arcs_float.astype(np.int64)
     if len(arcs) and (arcs.min() < 0 or arcs.max() >= len(nodes)):
         raise ValueError(f"{tid}: arc endpoint outside node table")
-    if len(route) and (route.min() < 0 or route.max() >= len(arcs)):
-        raise ValueError(f"{tid}: route arc ID outside arc table")
+    route = np.empty(0, dtype=np.int64)
+    if include_route:
+        route_path = trip_dir / f"{tid}.route"
+        route_float = read_numeric(route_path, 1).reshape(-1)
+        if not np.equal(route_float, np.floor(route_float)).all():
+            raise ValueError(f"{tid}: route entries must be integer arc IDs")
+        route = route_float.astype(np.int64)
+        if len(route) and (route.min() < 0 or route.max() >= len(arcs)):
+            raise ValueError(f"{tid}: route arc ID outside arc table")
     return track, nodes, arcs, route
 
 
-def build_candidates(track, nodes, arcs, trip_id, partition,
-                     radius_m=DEFAULT_RADIUS_M, max_candidates=DEFAULT_MAX_CANDIDATES):
-    if len(track) == 0 or len(nodes) == 0 or len(arcs) == 0:
-        return pd.DataFrame()
-
-    lon0, lat0 = float(np.mean(track[:, 0])), float(np.mean(track[:, 1]))
-    node_xy = local_xy(nodes[:, 0], nodes[:, 1], lon0, lat0)
-    gps_xy = local_xy(track[:, 0], track[:, 1], lon0, lat0)
-
-    start_xy = node_xy[arcs[:, 0]]
-    end_xy = node_xy[arcs[:, 1]]
-    midpoint_xy = (start_xy + end_xy) / 2.0
-    half_lengths = np.linalg.norm(end_xy - start_xy, axis=1) / 2.0
-
-    # Query segment midpoints using radius + maximum half segment length.
-    tree = cKDTree(midpoint_xy)
-    max_half = float(half_lengths.max()) if len(half_lengths) else 0.0
-    search_r = radius_m + max_half
-    neighbor_lists = tree.query_ball_point(gps_xy, r=search_r)
-
-    timestamps = track[:, 2]
+def motion_features(track: np.ndarray, gps_xy: np.ndarray):
     n = len(track)
-    gps_speed = np.zeros(n, dtype=float)
-    gps_heading = np.zeros(n, dtype=float)
-    time_delta = np.zeros(n, dtype=float)
-    gps_step_distance = np.zeros(n, dtype=float)
-
-    for i in range(n):
-        j = i + 1 if i < n - 1 else i - 1
-        if n < 2:
-            continue
-        dt = timestamps[j] - timestamps[i]
-        if j < i:
-            dt = -dt
-        if dt <= 0:
-            continue
-        d = float(haversine_m(track[i, 0], track[i, 1], track[j, 0], track[j, 1]))
-        gps_step_distance[i] = d
-        time_delta[i] = dt
-        gps_speed[i] = d / dt
-        gps_heading[i] = float(bearing_deg(track[i, 0], track[i, 1], track[j, 0], track[j, 1]))
-
-    rows = []
-    for i, arc_candidates in enumerate(neighbor_lists):
-        if not arc_candidates:
-            continue
-        ids = np.asarray(arc_candidates, dtype=np.int64)
-        px, py = gps_xy[i]
-        dist, frac = point_segment_projection(
-            np.full(len(ids), px), np.full(len(ids), py),
-            start_xy[ids, 0], start_xy[ids, 1], end_xy[ids, 0], end_xy[ids, 1]
-        )
-        keep = dist <= radius_m
-        ids, dist, frac = ids[keep], dist[keep], frac[keep]
-        if len(ids) == 0:
-            continue
-
-        road_heading = bearing_deg(
-            nodes[arcs[ids, 0], 0], nodes[arcs[ids, 0], 1],
-            nodes[arcs[ids, 1], 0], nodes[arcs[ids, 1], 1]
-        )
-        hd = angle_diff_deg(gps_heading[i], road_heading)
-        order = np.lexsort((hd, dist))[:max_candidates]
-        ids, dist, frac, road_heading, hd = ids[order], dist[order], frac[order], road_heading[order], hd[order]
-
-        for rank, (aid, d, t, rh, hdiff) in enumerate(zip(ids, dist, frac, road_heading, hd), start=1):
-            rows.append({
-                "partition": partition,
-                "trip_id": trip_id,
-                "gps_point_id": i,
-                "timestamp": float(timestamps[i]),
-                "gps_lon": float(track[i, 0]),
-                "gps_lat": float(track[i, 1]),
-                "candidate_arc_id": int(aid),
-                "distance_to_road_m": float(d),
-                "gps_step_distance_m": float(gps_step_distance[i]),
-                "time_delta_s": float(time_delta[i]),
-                "gps_speed_mps": float(gps_speed[i]),
-                "gps_heading_deg": float(gps_heading[i]),
-                "road_heading_deg": float(rh),
-                "heading_difference_deg": float(hdiff),
-                "candidate_fraction": float(t),
-                "candidate_rank": int(rank),
-                "candidate_count": int(len(ids)),
-                "from_node_id": int(arcs[aid, 0]),
-                "to_node_id": int(arcs[aid, 1]),
-            })
-    return pd.DataFrame(rows)
+    time_delta = np.full(n, np.nan)
+    step_distance = np.full(n, np.nan)
+    speed = np.full(n, np.nan)
+    heading = np.full(n, np.nan)
+    if n < 2:
+        return time_delta, step_distance, speed, heading
+    dts = np.diff(track[:, 2])
+    steps = np.linalg.norm(np.diff(gps_xy, axis=0), axis=1)
+    bearings = bearing_xy(gps_xy[:-1], gps_xy[1:])
+    time_delta[1:] = dts
+    step_distance[1:] = steps
+    valid_speed = np.isfinite(dts) & (dts > 0)
+    speed[1:][valid_speed] = steps[valid_speed] / dts[valid_speed]
+    moving = steps > 0.05
+    heading[1:][moving] = bearings[moving]
+    if moving[0]:
+        heading[0] = bearings[0]
+    return time_delta, step_distance, speed, heading
 
 
-def attach_training_labels(candidates: pd.DataFrame, route: np.ndarray,
-                           max_label_distance_m=LABEL_MAX_DISTANCE_M) -> pd.DataFrame:
-    """Conservative route-order alignment, not a GPS-to-route row-index assumption.
+def add_training_labels(frame: pd.DataFrame, route: np.ndarray, max_distance_m: float):
+    """Attach cautious labels by monotonic matching to the ordered reference route.
 
-    For each GPS point, use the closest route arc that is among nearby candidates,
-    while preserving non-decreasing route position. If no plausible route arc is
-    present, retain label=-1 (unknown). The caller excludes unknown labels.
+    Only candidates occurring at/after the previous matched route position can
+    be selected. If no candidate is close enough, all candidates for that GPS
+    observation remain label=-1 (unknown), not fabricated negatives.
     """
-    if candidates.empty:
-        candidates["label"] = pd.Series(dtype="int64")
-        candidates["label_status"] = pd.Series(dtype="object")
-        return candidates
-
-    candidates = candidates.copy()
-    candidates["label"] = -1
-    candidates["label_status"] = "unmatched"
+    out = frame.copy()
+    out["label"] = -1
+    out["label_status"] = "unmatched_reference"
+    if out.empty or len(route) == 0:
+        return out
 
     route_positions: dict[int, list[int]] = {}
     for pos, arc_id in enumerate(route.tolist()):
         route_positions.setdefault(int(arc_id), []).append(pos)
 
-    prev_route_pos = 0
-    for gps_id, indices in candidates.groupby("gps_point_id", sort=True).groups.items():
-        group = candidates.loc[indices]
-        plausible = group[group["distance_to_road_m"] <= max_label_distance_m]
+    previous_pos = 0
+    for _, indices in out.groupby("gps_point_id", sort=True).groups.items():
+        group = out.loc[indices]
         options = []
-        for idx, row in plausible.iterrows():
-            for rp in route_positions.get(int(row["candidate_arc_id"]), []):
-                if rp >= prev_route_pos:
-                    options.append((float(row["distance_to_road_m"]), rp, idx))
-        if not options:
-            continue
-        options.sort()
-        best_distance, best_pos, best_idx = options[0]
-        candidates.loc[indices, "label"] = 0
-        candidates.loc[best_idx, "label"] = 1
-        candidates.loc[indices, "label_status"] = "aligned"
-        prev_route_pos = best_pos
-    return candidates
+        for row_index, row in group.iterrows():
+            possible = route_positions.get(int(row["candidate_arc_id"]), [])
+            offset = bisect_left(possible, previous_pos)
+            if offset == len(possible):
+                continue
+            route_pos = possible[offset]
+            distance = float(row["distance_to_road_m"])
+            if distance <= max_distance_m:
+                options.append((distance, route_pos, row_index))
+        if options:
+            options.sort(key=lambda item: (item[0], item[1]))
+            _, selected_route_pos, selected_row = options[0]
+            out.loc[indices, "label"] = 0
+            out.loc[selected_row, "label"] = 1
+            out.loc[indices, "label_status"] = "route_aligned_approx"
+            previous_pos = selected_route_pos
+    return out
 
 
-def process_partition(root: Path, partition: str, output_dir: Path,
-                      radius_m: float, max_candidates: int):
-    part_dir = root / partition
-    if not part_dir.is_dir():
-        raise FileNotFoundError(f"Missing partition: {part_dir}")
-    outputs = []
-    summary = []
-    trips = sorted(p for p in part_dir.iterdir() if p.is_dir())
-    for trip_dir in trips:
-        track, nodes, arcs, route = load_trip(trip_dir)
-        df = build_candidates(track, nodes, arcs, trip_dir.name, partition,
-                               radius_m=radius_m, max_candidates=max_candidates)
-        if partition == "train":
-            df = attach_training_labels(df, route)
-        else:
-            df["label"] = -1
-            df["label_status"] = "not_available"
-        outputs.append(df)
-        summary.append({
-            "partition": partition,
-            "trip_id": trip_dir.name,
-            "gps_points": len(track),
-            "candidate_rows": len(df),
-            "gps_points_with_candidates": int(df["gps_point_id"].nunique()) if not df.empty else 0,
-            "positive_labels": int((df.get("label", pd.Series(dtype=int)) == 1).sum()),
-            "unmatched_gps_points": int((df.groupby("gps_point_id")["label"].max() == -1).sum()) if partition == "train" and not df.empty else 0,
-        })
-        print(f"[{partition}] {trip_dir.name}: GPS={len(track):,}, candidates={len(df):,}")
-    all_df = pd.concat(outputs, ignore_index=True) if outputs else pd.DataFrame()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    all_df.to_csv(output_dir / f"{partition}_candidates.csv", index=False)
-    pd.DataFrame(summary).to_csv(output_dir / f"{partition}_candidate_summary.csv", index=False)
-    return all_df, pd.DataFrame(summary)
+def process_trip(trip_dir: Path, partition: str, radius_m: float,
+                 max_candidates: int, label_max_distance_m: float):
+    tid = trip_dir.name
+    track, nodes_lonlat, arcs, route = load_trip(trip_dir, include_route=(partition == "train"))
+    if not len(track) or not len(nodes_lonlat) or not len(arcs):
+        raise ValueError(f"{tid}: .track, .nodes and .arcs must be non-empty")
+
+    # Metric trip-local projection: do not compute distances in raw degrees.
+    lon0, lat0 = float(np.mean(track[:, 0])), float(np.mean(track[:, 1]))
+    gps_xy = project_local(track[:, :2], lon0, lat0)
+    nodes_xy = project_local(nodes_lonlat, lon0, lat0)
+    from_ids, to_ids = arcs[:, 0], arcs[:, 1]
+    seg_a, seg_b = nodes_xy[from_ids], nodes_xy[to_ids]
+    lengths = np.linalg.norm(seg_b - seg_a, axis=1)
+    road_headings = bearing_xy(seg_a, seg_b)
+
+    # STRtree dwithin searches actual finite segments, not just their midpoints.
+    geometries = np.asarray([LineString((a, b)) for a, b in zip(seg_a, seg_b)], dtype=object)
+    tree = STRtree(geometries)
+    gps_points = points(gps_xy[:, 0], gps_xy[:, 1])
+    pairs = tree.query(gps_points, predicate="dwithin", distance=radius_m)
+    per_point: list[list[int]] = [[] for _ in range(len(track))]
+    if pairs.size:
+        for gps_index, arc_index in zip(pairs[0].tolist(), pairs[1].tolist()):
+            per_point[gps_index].append(arc_index)
+
+    dt, step_m, speed, gps_heading = motion_features(track, gps_xy)
+    rows = []
+    for gps_index, found in enumerate(per_point):
+        fallback = len(found) == 0
+        arc_positions = np.asarray(
+            [int(tree.nearest(gps_points[gps_index]))] if fallback else found,
+            dtype=np.int64,
+        )
+        gps_repeat = np.repeat(gps_xy[gps_index][None, :], len(arc_positions), axis=0)
+        distances, fractions = point_segment_features(gps_repeat, seg_a[arc_positions], seg_b[arc_positions])
+        within = distances <= radius_m
+        if not within.any():
+            within[np.argmin(distances)] = True
+        arc_positions, distances, fractions = arc_positions[within], distances[within], fractions[within]
+        order = np.argsort(distances, kind="stable")[:max_candidates]
+        arc_positions, distances, fractions = arc_positions[order], distances[order], fractions[order]
+
+        for rank, (arc_pos, distance, fraction) in enumerate(zip(arc_positions, distances, fractions), 1):
+            gps_h = float(gps_heading[gps_index]) if np.isfinite(gps_heading[gps_index]) else np.nan
+            road_h = float(road_headings[arc_pos])
+            rows.append({
+                "partition": partition, "trip_id": tid, "gps_point_id": gps_index,
+                "timestamp_s": float(track[gps_index, 2]),
+                "gps_lon": float(track[gps_index, 0]), "gps_lat": float(track[gps_index, 1]),
+                "candidate_arc_id": int(arc_pos),
+                "from_node_id": int(from_ids[arc_pos]), "to_node_id": int(to_ids[arc_pos]),
+                "distance_to_road_m": float(distance),
+                "candidate_projection_fraction": float(fraction),
+                "candidate_road_length_m": float(lengths[arc_pos]),
+                "gps_step_distance_m": float(step_m[gps_index]) if np.isfinite(step_m[gps_index]) else np.nan,
+                "time_delta_s": float(dt[gps_index]) if np.isfinite(dt[gps_index]) else np.nan,
+                "gps_speed_mps": float(speed[gps_index]) if np.isfinite(speed[gps_index]) else np.nan,
+                "gps_heading_deg": gps_h, "road_heading_deg": road_h,
+                "heading_difference_deg": angle_difference(gps_h, road_h) if np.isfinite(gps_h) else np.nan,
+                "candidate_rank": rank,
+                "candidate_count_within_radius": 0 if fallback else len(found),
+                "candidate_is_fallback": fallback,
+            })
+
+    frame = pd.DataFrame(rows)
+    if partition == "train":
+        frame = add_training_labels(frame, route, label_max_distance_m)
+    else:
+        frame["label"] = -1
+        frame["label_status"] = "not_used_for_inference"
+
+    if partition == "train" and not frame.empty:
+        point_labels = frame.groupby("gps_point_id")["label"].max()
+        aligned = int((point_labels == 1).sum())
+        unmatched = int((point_labels == -1).sum())
+        coverage = aligned / len(point_labels) if len(point_labels) else np.nan
+        positive_distance = float(frame.loc[frame.label == 1, "distance_to_road_m"].mean()) if aligned else np.nan
+    else:
+        aligned = unmatched = 0
+        coverage = positive_distance = np.nan
+
+    summary = {
+        "partition": partition, "trip_id": tid,
+        "gps_observations": len(track), "road_nodes": len(nodes_lonlat), "road_arcs": len(arcs),
+        "candidate_rows": len(frame),
+        "gps_points_with_candidates": int(frame.gps_point_id.nunique()) if not frame.empty else 0,
+        "mean_candidates_per_gps": float(frame.groupby("gps_point_id").size().mean()) if not frame.empty else 0.0,
+        "route_aligned_points": aligned, "unmatched_points": unmatched,
+        "route_candidate_coverage": coverage, "mean_positive_distance_m": positive_distance,
+        "fallback_candidate_points": int(frame.loc[frame.candidate_is_fallback, "gps_point_id"].nunique()) if not frame.empty else 0,
+    }
+    return frame, summary
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path, required=True,
-                        help="Path to Data_Preprocessing/cleaned_dataset")
+                        help="Member 1A cleaned_dataset folder containing train/ and student_test/")
     parser.add_argument("--output-dir", type=Path, default=Path("Member_1B/outputs"))
-    parser.add_argument("--radius-m", type=float, default=DEFAULT_RADIUS_M)
-    parser.add_argument("--max-candidates", type=int, default=DEFAULT_MAX_CANDIDATES)
-    parser.add_argument("--partitions", nargs="+", default=["train", "student_test"],
-                        choices=["train", "student_test"])
+    parser.add_argument("--radius-m", type=float, default=100.0)
+    parser.add_argument("--max-candidates", type=int, default=8)
+    parser.add_argument("--label-max-distance-m", type=float, default=100.0)
+    parser.add_argument("--partitions", nargs="+", choices=("train", "student_test"),
+                        default=("train", "student_test"))
     args = parser.parse_args()
-    if args.radius_m <= 0 or args.max_candidates <= 0:
-        parser.error("--radius-m and --max-candidates must be positive")
+    if min(args.radius_m, args.label_max_distance_m) <= 0 or args.max_candidates <= 0:
+        parser.error("radius, label-max-distance and max-candidates must be positive")
 
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    summaries = []
     for partition in args.partitions:
-        process_partition(args.data_root, partition, args.output_dir,
-                          args.radius_m, args.max_candidates)
-    print(f"Done. Outputs saved under: {args.output_dir.resolve()}")
+        folder = args.data_root / partition
+        if not folder.is_dir():
+            raise FileNotFoundError(f"Partition directory not found: {folder}")
+        trip_dirs = sorted(p for p in folder.iterdir() if p.is_dir())
+        print(f"\nProcessing {partition}: {len(trip_dirs)} trips")
+        frames = []
+        for index, trip_dir in enumerate(trip_dirs, 1):
+            frame, summary = process_trip(trip_dir, partition, args.radius_m,
+                                          args.max_candidates, args.label_max_distance_m)
+            if not frame.empty:
+                frames.append(frame)
+            summaries.append(summary)
+            print(f"[{index}/{len(trip_dirs)}] {trip_dir.name}: {summary['candidate_rows']:,} candidates; "
+                  f"route-aligned={summary['route_aligned_points']}")
+        combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        output = args.output_dir / f"{partition}_candidates.csv"
+        combined.to_csv(output, index=False)
+        print(f"Saved {output} ({len(combined):,} rows)")
+
+    summary_path = args.output_dir / "candidate_generation_summary.csv"
+    pd.DataFrame(summaries).to_csv(summary_path, index=False)
+    print(f"Saved {summary_path}")
+    print("Reminder: route-derived labels are approximate; inspect alignment diagnostics before training.")
 
 
 if __name__ == "__main__":
