@@ -91,34 +91,63 @@ def load_trip(trip_dir: Path, include_route: bool):
     return track, nodes, arcs, route
 
 
+def classify_gap(seconds: float) -> str:
+    """Match Member 1A's timestamp interval classes."""
+    if seconds <= 0:
+        return "nonincreasing_timestamp"
+    if seconds <= 2:
+        return "regular"
+    if seconds <= 10:
+        return "irregular_2_to_10s"
+    if seconds <= 60:
+        return "large_10_to_60s"
+    return "extreme_over_60s"
+
+
 def motion_features(track: np.ndarray, gps_xy: np.ndarray):
+    """Compute motion features only when the preceding interval is <= 10s.
+
+    GPS observations are never removed or interpolated. Step distance and time
+    delta are retained for auditing, but speed and heading are suppressed for
+    large, extreme, and non-increasing intervals because those estimates can
+    be misleading.
+    """
     n = len(track)
     time_delta = np.full(n, np.nan)
     step_distance = np.full(n, np.nan)
     speed = np.full(n, np.nan)
     heading = np.full(n, np.nan)
+    gap_class = np.full(n, "no_previous_point", dtype=object)
+    motion_valid = np.zeros(n, dtype=bool)
     if n < 2:
-        return time_delta, step_distance, speed, heading
+        return time_delta, step_distance, speed, heading, gap_class, motion_valid
+
     dts = np.diff(track[:, 2])
     steps = np.linalg.norm(np.diff(gps_xy, axis=0), axis=1)
     bearings = bearing_xy(gps_xy[:-1], gps_xy[1:])
     time_delta[1:] = dts
     step_distance[1:] = steps
-    valid_speed = np.isfinite(dts) & (dts > 0)
-    speed[1:][valid_speed] = steps[valid_speed] / dts[valid_speed]
-    moving = steps > 0.05
-    heading[1:][moving] = bearings[moving]
-    if moving[0]:
-        heading[0] = bearings[0]
-    return time_delta, step_distance, speed, heading
+
+    for gps_index, seconds in enumerate(dts, start=1):
+        kind = classify_gap(float(seconds))
+        gap_class[gps_index] = kind
+        if kind in {"regular", "irregular_2_to_10s"}:
+            motion_valid[gps_index] = True
+            speed[gps_index] = steps[gps_index - 1] / seconds
+            if steps[gps_index - 1] > 0.05:
+                heading[gps_index] = bearings[gps_index - 1]
+
+    return time_delta, step_distance, speed, heading, gap_class, motion_valid
 
 
-def add_training_labels(frame: pd.DataFrame, route: np.ndarray, max_distance_m: float):
-    """Attach cautious labels by monotonic matching to the ordered reference route.
+def add_training_labels(frame: pd.DataFrame, route: np.ndarray, max_distance_m: float,
+                        review_transition_positions: set[int] | None = None):
+    """Attach approximate route labels while excluding flagged transition arcs.
 
-    Only candidates occurring at/after the previous matched route position can
-    be selected. If no candidate is close enough, all candidates for that GPS
-    observation remain label=-1 (unknown), not fabricated negatives.
+    Member 1A stores the current arc's 1-based route_position for each flagged
+    transition. Both adjacent 0-based route entries are treated as review
+    positions. Candidates that can only align to those positions remain
+    unknown (-1), rather than becoming positives or false negatives.
     """
     out = frame.copy()
     out["label"] = -1
@@ -126,39 +155,61 @@ def add_training_labels(frame: pd.DataFrame, route: np.ndarray, max_distance_m: 
     if out.empty or len(route) == 0:
         return out
 
+    review_positions = review_transition_positions or set()
     route_positions: dict[int, list[int]] = {}
     for pos, arc_id in enumerate(route.tolist()):
         route_positions.setdefault(int(arc_id), []).append(pos)
 
-    # Limit route-index jumps so a crossing far ahead in the route cannot
-    # pull the alignment forward and make later GPS observations appear out of order.
     gps_count = max(1, int(out["gps_point_id"].nunique()))
     max_route_advance = max(2, min(50, int(math.ceil(12.0 * len(route) / gps_count + 5.0))))
     previous_pos = 0
     for _, indices in out.groupby("gps_point_id", sort=True).groups.items():
         group = out.loc[indices]
         options = []
+        review_only_rows = set()
+
         for row_index, row in group.iterrows():
+            distance = float(row["distance_to_road_m"])
+            if distance > max_distance_m:
+                continue
+
             possible = route_positions.get(int(row["candidate_arc_id"]), [])
             offset = bisect_left(possible, previous_pos)
-            if offset == len(possible):
-                continue
-            route_pos = possible[offset]
-            distance = float(row["distance_to_road_m"])
-            if route_pos <= previous_pos + max_route_advance and distance <= max_distance_m:
+            saw_review_position = False
+            found_valid_position = False
+
+            for route_pos in possible[offset:]:
+                if route_pos > previous_pos + max_route_advance:
+                    break
+                if route_pos in review_positions:
+                    saw_review_position = True
+                    continue
                 options.append((distance, route_pos, row_index))
+                found_valid_position = True
+                break
+
+            if saw_review_position and not found_valid_position:
+                review_only_rows.add(row_index)
+
         if options:
             options.sort(key=lambda item: (item[0], item[1]))
             _, selected_route_pos, selected_row = options[0]
             out.loc[indices, "label"] = 0
+            if review_only_rows:
+                out.loc[list(review_only_rows), "label"] = -1
             out.loc[selected_row, "label"] = 1
-            out.loc[indices, "label_status"] = "route_aligned_approx"
+            status = "route_aligned_transition_excluded" if review_only_rows else "route_aligned_approx"
+            out.loc[indices, "label_status"] = status
             previous_pos = selected_route_pos
+        elif review_only_rows:
+            out.loc[indices, "label_status"] = "route_transition_review"
+
     return out
 
 
 def process_trip(trip_dir: Path, partition: str, radius_m: float,
-                 max_candidates: int, label_max_distance_m: float):
+                 max_candidates: int, label_max_distance_m: float,
+                 review_transition_positions: list[int] | None = None):
     tid = trip_dir.name
     track, nodes_lonlat, arcs, route = load_trip(trip_dir, include_route=(partition == "train"))
     if not len(track) or not len(nodes_lonlat) or not len(arcs):
@@ -183,7 +234,7 @@ def process_trip(trip_dir: Path, partition: str, radius_m: float,
         for gps_index, arc_index in zip(pairs[0].tolist(), pairs[1].tolist()):
             per_point[gps_index].append(arc_index)
 
-    dt, step_m, speed, gps_heading = motion_features(track, gps_xy)
+    dt, step_m, speed, gps_heading, gap_class, motion_valid = motion_features(track, gps_xy)
     rows = []
     for gps_index, found in enumerate(per_point):
         fallback = len(found) == 0
@@ -215,6 +266,8 @@ def process_trip(trip_dir: Path, partition: str, radius_m: float,
                 "gps_step_distance_m": float(step_m[gps_index]) if np.isfinite(step_m[gps_index]) else np.nan,
                 "time_delta_s": float(dt[gps_index]) if np.isfinite(dt[gps_index]) else np.nan,
                 "gps_speed_mps": float(speed[gps_index]) if np.isfinite(speed[gps_index]) else np.nan,
+                "gps_gap_class": str(gap_class[gps_index]),
+                "gps_motion_valid": bool(motion_valid[gps_index]),
                 "gps_heading_deg": gps_h, "road_heading_deg": road_h,
                 "heading_difference_deg": angle_difference(gps_h, road_h) if np.isfinite(gps_h) else np.nan,
                 "candidate_rank": rank,
@@ -223,22 +276,48 @@ def process_trip(trip_dir: Path, partition: str, radius_m: float,
             })
 
     frame = pd.DataFrame(rows)
+    review_route_positions = set()
+    for one_based_position in (review_transition_positions or []):
+        # route_issues.csv records the current arc's 1-based route position.
+        # Convert both sides of that transition to 0-based route indices.
+        if one_based_position >= 2:
+            review_route_positions.add(one_based_position - 2)
+            review_route_positions.add(one_based_position - 1)
+
     if partition == "train":
-        frame = add_training_labels(frame, route, label_max_distance_m)
+        frame = add_training_labels(frame, route, label_max_distance_m, review_route_positions)
     else:
         frame["label"] = -1
         frame["label_status"] = "not_used_for_inference"
 
-    if partition == "train" and not frame.empty:
-        point_labels = frame.groupby("gps_point_id")["label"].max()
-        aligned = int((point_labels == 1).sum())
-        unmatched = int((point_labels == -1).sum())
-        coverage = aligned / len(point_labels) if len(point_labels) else np.nan
-        positive_distance = float(frame.loc[frame.label == 1, "distance_to_road_m"].mean()) if aligned else np.nan
+    if not frame.empty:
+        point_status = frame.groupby("gps_point_id")["label_status"].first()
+        aligned = int(point_status.isin([
+            "route_aligned_approx", "route_aligned_transition_excluded"
+        ]).sum()) if partition == "train" else 0
+        unmatched = int(point_status.isin([
+            "unmatched_reference", "route_transition_review"
+        ]).sum()) if partition == "train" else 0
+        transition_review_points = int(point_status.isin([
+            "route_aligned_transition_excluded", "route_transition_review"
+        ]).sum()) if partition == "train" else 0
+        coverage = aligned / len(point_status) if partition == "train" and len(point_status) else np.nan
+        positive_rows = int((frame["label"] == 1).sum())
+        negative_rows = int((frame["label"] == 0).sum())
+        unknown_rows = int((frame["label"] == -1).sum())
+        positive_distance = float(frame.loc[frame.label == 1, "distance_to_road_m"].mean()) if positive_rows else np.nan
     else:
-        aligned = unmatched = 0
+        aligned = unmatched = transition_review_points = 0
+        positive_rows = negative_rows = unknown_rows = 0
         coverage = positive_distance = np.nan
 
+    gap_counts = {
+        "regular": int(np.sum(gap_class == "regular")),
+        "irregular_2_to_10s": int(np.sum(gap_class == "irregular_2_to_10s")),
+        "large_10_to_60s": int(np.sum(gap_class == "large_10_to_60s")),
+        "extreme_over_60s": int(np.sum(gap_class == "extreme_over_60s")),
+        "nonincreasing_timestamp": int(np.sum(gap_class == "nonincreasing_timestamp")),
+    }
     summary = {
         "partition": partition, "trip_id": tid,
         "gps_observations": len(track), "road_nodes": len(nodes_lonlat), "road_arcs": len(arcs),
@@ -247,6 +326,16 @@ def process_trip(trip_dir: Path, partition: str, radius_m: float,
         "mean_candidates_per_gps": float(frame.groupby("gps_point_id").size().mean()) if not frame.empty else 0.0,
         "route_aligned_points": aligned, "unmatched_points": unmatched,
         "route_candidate_coverage": coverage, "mean_positive_distance_m": positive_distance,
+        "positive_candidate_rows": positive_rows, "negative_candidate_rows": negative_rows,
+        "unknown_candidate_rows": unknown_rows,
+        "route_transition_review_transitions": len(review_transition_positions or []) if partition == "train" else 0,
+        "route_transition_review_positions": len(review_route_positions) if partition == "train" else 0,
+        "route_transition_review_points": transition_review_points,
+        "regular_intervals": gap_counts["regular"],
+        "irregular_intervals_2_to_10s": gap_counts["irregular_2_to_10s"],
+        "large_intervals_10_to_60s": gap_counts["large_10_to_60s"],
+        "extreme_intervals_over_60s": gap_counts["extreme_over_60s"],
+        "nonincreasing_intervals": gap_counts["nonincreasing_timestamp"],
         "fallback_candidate_points": int(frame.loc[frame.candidate_is_fallback, "gps_point_id"].nunique()) if not frame.empty else 0,
     }
     return frame, summary
@@ -260,6 +349,8 @@ def main():
     parser.add_argument("--radius-m", type=float, default=100.0)
     parser.add_argument("--max-candidates", type=int, default=8)
     parser.add_argument("--label-max-distance-m", type=float, default=100.0)
+    parser.add_argument("--route-issues", type=Path, default=None,
+                        help="Member 1A route_issues.csv; defaults to the parent of --data-root")
     parser.add_argument("--partitions", nargs="+", choices=("train", "student_test"),
                         default=("train", "student_test"))
     args = parser.parse_args()
@@ -267,6 +358,34 @@ def main():
         parser.error("radius, label-max-distance and max-candidates must be positive")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    route_issues_path = args.route_issues or (args.data_root.parent / "route_issues.csv")
+    review_transitions_by_trip: dict[str, list[int]] = {}
+    route_review_rows = pd.DataFrame(columns=[
+        "partition", "trip_id", "issue_type", "route_position", "source_line",
+        "previous_arc_id", "current_arc_id", "previous_endpoints",
+        "current_endpoints", "classification",
+    ])
+    if route_issues_path.is_file():
+        route_issue_frame = pd.read_csv(route_issues_path, dtype={"trip_id": str})
+        required = {"partition", "trip_id", "issue_type", "route_position"}
+        missing = required - set(route_issue_frame.columns)
+        if missing:
+            raise ValueError(f"{route_issues_path}: missing columns {sorted(missing)}")
+        route_review_rows = route_issue_frame[
+            (route_issue_frame["partition"] == "train") &
+            (route_issue_frame["issue_type"] == "route_transition_review")
+        ].copy()
+        for _, issue in route_review_rows.iterrows():
+            if pd.notna(issue["route_position"]):
+                review_transitions_by_trip.setdefault(str(issue["trip_id"]), []).append(
+                    int(issue["route_position"])
+                )
+        print(f"Loaded {len(route_review_rows)} flagged training route transitions from {route_issues_path}")
+    else:
+        print(f"WARNING: route issue report not found at {route_issues_path}; "
+              "training labels will not exclude flagged route transitions.")
+
     summaries = []
     for partition in args.partitions:
         folder = args.data_root / partition
@@ -276,8 +395,11 @@ def main():
         print(f"\nProcessing {partition}: {len(trip_dirs)} trips")
         frames = []
         for index, trip_dir in enumerate(trip_dirs, 1):
-            frame, summary = process_trip(trip_dir, partition, args.radius_m,
-                                          args.max_candidates, args.label_max_distance_m)
+            frame, summary = process_trip(
+                trip_dir, partition, args.radius_m, args.max_candidates,
+                args.label_max_distance_m,
+                review_transitions_by_trip.get(trip_dir.name, []) if partition == "train" else [],
+            )
             if not frame.empty:
                 frames.append(frame)
             summaries.append(summary)
@@ -291,7 +413,19 @@ def main():
     summary_path = args.output_dir / "candidate_generation_summary.csv"
     pd.DataFrame(summaries).to_csv(summary_path, index=False)
     print(f"Saved {summary_path}")
-    print("Reminder: route-derived labels are approximate; inspect alignment diagnostics before training.")
+
+    if not route_review_rows.empty:
+        route_review_rows["excluded_route_positions_0_based"] = route_review_rows["route_position"].apply(
+            lambda value: f"{int(value) - 2},{int(value) - 1}" if int(value) >= 2 else ""
+        )
+        route_review_rows["label_handling"] = (
+            "Adjacent route entries excluded from positive label alignment; affected candidates remain unknown"
+        )
+    review_output = args.output_dir / "route_transition_label_review.csv"
+    route_review_rows.to_csv(review_output, index=False)
+    print(f"Saved {review_output}")
+    print("Motion policy: speed and heading are computed only for regular/irregular intervals up to 10 seconds.")
+    print("Reminder: route-derived labels are approximate; inspect candidate and label diagnostics before training.")
 
 
 if __name__ == "__main__":
