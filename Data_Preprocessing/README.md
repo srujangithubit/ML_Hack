@@ -9,7 +9,7 @@ This folder contains the dataset audit, conservative cleaning script, trip inven
 - `trip_inventory.csv` — per-trip audit of the source data.
 - `gps_gap_report.csv` — per-interval gap class for all non-regular timestamp steps; source observations remain untouched.
 - `route_issues.csv` — specific malformed, invalid-reference, and non-contiguous route/arc rows for review.
-- `cleaned_dataset/` — cleaned `train/` and `student_test/` trip files plus cleaning log and gap report.
+- `cleaned_dataset/` — cleaned `train/` and `student_test/` trip files plus `cleaning_log.csv`. Running the cleaner writes a detailed `gps_gap_report.csv` into its output folder.
 - `cleaned_dataset_audit.csv` — audit of the cleaned copy.
 - `eda.ipynb` — dataset summaries, plots, trajectory visualization, and a Folium map.
 
