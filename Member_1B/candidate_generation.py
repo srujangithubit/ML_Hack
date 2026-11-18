@@ -130,6 +130,10 @@ def add_training_labels(frame: pd.DataFrame, route: np.ndarray, max_distance_m: 
     for pos, arc_id in enumerate(route.tolist()):
         route_positions.setdefault(int(arc_id), []).append(pos)
 
+    # Limit route-index jumps so a crossing far ahead in the route cannot
+    # pull the alignment forward and make later GPS observations appear out of order.
+    gps_count = max(1, int(out["gps_point_id"].nunique()))
+    max_route_advance = max(2, min(50, int(math.ceil(12.0 * len(route) / gps_count + 5.0))))
     previous_pos = 0
     for _, indices in out.groupby("gps_point_id", sort=True).groups.items():
         group = out.loc[indices]
@@ -141,7 +145,7 @@ def add_training_labels(frame: pd.DataFrame, route: np.ndarray, max_distance_m: 
                 continue
             route_pos = possible[offset]
             distance = float(row["distance_to_road_m"])
-            if distance <= max_distance_m:
+            if route_pos <= previous_pos + max_route_advance and distance <= max_distance_m:
                 options.append((distance, route_pos, row_index))
         if options:
             options.sort(key=lambda item: (item[0], item[1]))
